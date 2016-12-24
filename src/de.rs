@@ -1,8 +1,7 @@
-use std::cell::RefCell;
 use std::fmt::Display;
-use std::mem;
 
 use serde;
+use serde_stateful_deserialize::{DeserializeState, MapVisitorExt, SeqVisitorExt, VariantVisitorExt};
 
 use any::Any;
 use error::Error;
@@ -431,88 +430,6 @@ impl<T> ReifiedDeserialize for Witness<T> where T: serde::Deserialize {
     }
 }
 
-// STACK ///////////////////////////////////////////////////////////////////////
-
-thread_local! {
-    static STACK: RefCell<Vec<&'static mut ReifiedDeserialize>> = RefCell::new(Vec::new())
-}
-
-macro_rules! stack_guard {
-    ($($rei:ident),* => $body:expr) => {
-        unsafe { $( stack_push($rei); )* }
-        $body.map_err(erase).and_then(GuardedRet::finalize)
-    };
-}
-
-unsafe fn stack_push(rei: &mut ReifiedDeserialize) {
-    // Cast away the lifetime. Okay as long as it is gone from the stack before
-    // the caller returns.
-    let rei = mem::transmute(rei);
-
-    STACK.with(|s| s.borrow_mut().push(rei));
-}
-
-// If `SeqVisitor::visit` or `MapVisitor::visit_key` returns None, nothing was
-// deserialized and the unused entries need to be cleaned up.
-fn stack_pop() -> Result<(), Error> {
-    STACK.with(|s| match s.borrow_mut().pop() {
-        Some(_) => Ok(()),
-        None => Err(Error::new("empty deserialize stack")),
-    })
-}
-
-struct DeserializeFromStack;
-
-impl serde::Deserialize for DeserializeFromStack {
-    fn deserialize<D>(deserializer: &mut D) -> Result<Self, D::Error>
-        where D: serde::Deserializer
-    {
-        let rei = match STACK.with(|s| s.borrow_mut().pop()) {
-            Some(rei) => rei,
-            None => return Err(serde::de::Error::custom("empty deserialize stack")),
-        };
-
-        rei.reified_deserialize(deserializer).map(|_| DeserializeFromStack).map_err(unerase)
-    }
-}
-
-trait GuardedRet {
-    type Ret;
-    fn finalize(self) -> Result<Self::Ret, Error>;
-}
-
-impl GuardedRet for DeserializeFromStack {
-    type Ret = ();
-    fn finalize(self) -> Result<Self::Ret, Error> {
-        Ok(())
-    }
-}
-
-impl GuardedRet for Option<DeserializeFromStack> {
-    type Ret = Option<()>;
-    fn finalize(self) -> Result<Self::Ret, Error> {
-        if self.is_some() {
-            Ok(Some(()))
-        } else {
-            try!(stack_pop());
-            Ok(None)
-        }
-    }
-}
-
-impl GuardedRet for Option<(DeserializeFromStack, DeserializeFromStack)> {
-    type Ret = Option<()>;
-    fn finalize(self) -> Result<Self::Ret, Error> {
-        if self.is_some() {
-            Ok(Some(()))
-        } else {
-            try!(stack_pop());
-            try!(stack_pop());
-            Ok(None)
-        }
-    }
-}
-
 // IMPL ERASED SERDE FOR SERDE /////////////////////////////////////////////////
 
 impl<T: ?Sized> Deserializer for T where T: serde::Deserializer {
@@ -689,11 +606,19 @@ impl<T: ?Sized> Visitor for T where T: serde::de::Visitor {
     }
 }
 
+impl<'a> DeserializeState for &'a mut ReifiedDeserialize {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: &mut D) -> Result<Self::Value, D::Error>
+        where D: serde::Deserializer
+    {
+        self.reified_deserialize(deserializer).map_err(unerase)
+    }
+}
+
 impl<T: ?Sized> SeqVisitor for T where T: serde::de::SeqVisitor {
     fn erased_visit(&mut self, rei: &mut ReifiedDeserialize) -> Result<Option<()>, Error> {
-        stack_guard! { rei =>
-            self.visit::<DeserializeFromStack>()
-        }
+        self.visit_state(rei).map_err(erase)
     }
     fn erased_end(&mut self) -> Result<(), Error> {
         self.end().map_err(erase)
@@ -705,31 +630,22 @@ impl<T: ?Sized> SeqVisitor for T where T: serde::de::SeqVisitor {
 
 impl<T: ?Sized> MapVisitor for T where T: serde::de::MapVisitor {
     fn erased_visit_key(&mut self, rei: &mut ReifiedDeserialize) -> Result<Option<()>, Error> {
-        stack_guard! { rei =>
-            self.visit_key::<DeserializeFromStack>()
-        }
+        self.visit_key_state(rei).map_err(erase)
     }
     fn erased_visit_value(&mut self, rei: &mut ReifiedDeserialize) -> Result<(), Error> {
-        stack_guard! { rei =>
-            self.visit_value::<DeserializeFromStack>()
-        }
+        self.visit_value_state(rei).map_err(erase)
     }
     fn erased_end(&mut self) -> Result<(), Error> {
         self.end().map_err(erase)
     }
     fn erased_visit(&mut self, k: &mut ReifiedDeserialize, v: &mut ReifiedDeserialize) -> Result<Option<()>, Error> {
-        // v, k in reverse order because k will be used first
-        stack_guard! { v, k =>
-            self.visit::<DeserializeFromStack, DeserializeFromStack>()
-        }
+        self.visit_state(k, v).map(|opt| opt.map(|((), ())| ())).map_err(erase)
     }
     fn erased_size_hint(&self) -> (usize, Option<usize>) {
         self.size_hint()
     }
     fn erased_missing_field(&mut self, field: &'static str, rei: &mut ReifiedDeserialize) -> Result<(), Error> {
-        stack_guard! { rei =>
-            self.missing_field::<DeserializeFromStack>(field)
-        }
+        self.missing_field_state(field, rei).map_err(erase)
     }
 }
 
@@ -741,14 +657,10 @@ impl<T: ?Sized> EnumVisitor for T where T: serde::de::EnumVisitor {
 
 impl<T: ?Sized> VariantVisitor for T where T: serde::de::VariantVisitor {
     fn erased_visit_variant(&mut self, rei: &mut ReifiedDeserialize) -> Result<(), Error> {
-        stack_guard! { rei =>
-            self.visit_variant::<DeserializeFromStack>()
-        }
+        self.visit_variant_state(rei).map_err(erase)
     }
     fn erased_visit_newtype(&mut self, rei: &mut ReifiedDeserialize) -> Result<(), Error> {
-        stack_guard! { rei =>
-            self.visit_newtype::<DeserializeFromStack>()
-        }
+        self.visit_newtype_state(rei).map_err(erase)
     }
     fn erased_visit_tuple(&mut self, len: usize, visitor: &mut Visitor) -> Result<Out, Error> {
         self.visit_tuple(len, visitor).map_err(erase)

@@ -1,4 +1,5 @@
 extern crate serde;
+extern crate serde_stateful_deserialize;
 
 mod any;
 mod de;
